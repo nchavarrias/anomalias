@@ -62,7 +62,7 @@ class TrafficAnomalyDetectorStreamlit:
     - Score se calcula correctamente
     """
     
-    def __init__(self, window_days=30, threshold=2.5):
+    def __init__(self, window_days=45, threshold=3.5):
         self.window_days = window_days
         self.window_minutos = window_days * 1440
         self.threshold = threshold  # ← AHORA ES PARÁMETRO
