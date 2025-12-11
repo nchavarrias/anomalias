@@ -195,7 +195,7 @@ if 'resultados' not in st.session_state:
     st.session_state.resultados = []
 
 if 'threshold_actual' not in st.session_state:
-    st.session_state.threshold_actual = 2.5
+    st.session_state.threshold_actual = 3.5
 
 
 # ============================================================================
