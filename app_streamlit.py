@@ -49,22 +49,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# CLASE DETECTOR (Método elegido: MAD Ventana Móvil)
+# CLASE DETECTOR (CORREGIDA)
 # ============================================================================
 
 class TrafficAnomalyDetectorStreamlit:
     """
     Detector de anomalías con MAD Ventana Móvil.
     
-    Método elegido para producción:
-    - Ventana móvil: 30 días
-    - Algoritmo: MAD + Modified Z-Score (consenso)
-    - Threshold: 2.5 MADs
+    CORRECCIONES:
+    - Threshold ahora es parámetro (no hardcodeado)
+    - MAD se calcula correctamente
+    - Score se calcula correctamente
     """
     
-    def __init__(self, window_days=30):
+    def __init__(self, window_days=30, threshold=2.5):
         self.window_days = window_days
         self.window_minutos = window_days * 1440
+        self.threshold = threshold  # ← AHORA ES PARÁMETRO
         
         # Buffer circular
         self.buffer = deque(maxlen=self.window_minutos)
@@ -79,12 +80,18 @@ class TrafficAnomalyDetectorStreamlit:
         self.score_history = []
     
     def cargar_historico(self, df):
-        """Cargar datos históricos"""
+        """Cargar datos históricos y entrenar baseline"""
         intensity = df['intensity'].values
         
+        # Calcular MEDIANA
         self.baseline_med = np.median(intensity)
-        mad_val = mad(intensity)
+        
+        # Calcular MAD (Median Absolute Deviation)
+        # MAD = mediana(|x - mediana|)
+        desviaciones = np.abs(intensity - self.baseline_med)
+        mad_val = np.median(desviaciones)  # ← CORREGIDO: usar np.median
         self.baseline_mad = mad_val if mad_val > 0 else np.std(intensity)
+        
         self.baseline_ts = datetime.now()
         
         self.buffer.extend(intensity)
@@ -95,17 +102,20 @@ class TrafficAnomalyDetectorStreamlit:
             'puntos': len(intensity)
         }
     
-    def procesar_punto(self, timestamp, intensity):
+    def procesar_punto(self, timestamp, intensity, threshold=None):
         """Detección en tiempo real"""
         if self.baseline_med is None:
             return None
+        
+        # Usar threshold del parámetro o el de la clase
+        th = threshold if threshold is not None else self.threshold
         
         # Cálculo O(1)
         desviacion_mads = abs(
             (intensity - self.baseline_med) / self.baseline_mad
         )
         
-        es_anomalia = desviacion_mads > 2.5
+        es_anomalia = desviacion_mads > th
         
         self.buffer.append(intensity)
         
@@ -115,7 +125,7 @@ class TrafficAnomalyDetectorStreamlit:
             'expected': self.baseline_med,
             'desviacion_mads': desviacion_mads,
             'es_anomalia': es_anomalia,
-            'confianza': min(desviacion_mads / 2.5, 1.0)
+            'confianza': min(desviacion_mads / th, 1.0) if th > 0 else 0
         }
         
         self.score_history.append(resultado)
@@ -125,11 +135,13 @@ class TrafficAnomalyDetectorStreamlit:
         
         return resultado
     
-    def procesar_lote(self, df):
+    def procesar_lote(self, df, threshold=None):
         """Procesar múltiples filas"""
         resultados = []
+        th = threshold if threshold is not None else self.threshold
+        
         for idx, row in df.iterrows():
-            resultado = self.procesar_punto(row['timestamp'], row['intensity'])
+            resultado = self.procesar_punto(row['timestamp'], row['intensity'], threshold=th)
             if resultado:
                 resultados.append(resultado)
         return resultados
@@ -141,8 +153,12 @@ class TrafficAnomalyDetectorStreamlit:
         
         datos = np.array(list(self.buffer))
         self.baseline_med = np.median(datos)
-        mad_val = mad(datos)
+        
+        # Recalcular MAD
+        desviaciones = np.abs(datos - self.baseline_med)
+        mad_val = np.median(desviaciones)
         self.baseline_mad = mad_val if mad_val > 0 else np.std(datos)
+        
         self.baseline_ts = datetime.now()
         
         return True
@@ -170,13 +186,16 @@ class TrafficAnomalyDetectorStreamlit:
 # ============================================================================
 
 if 'detector' not in st.session_state:
-    st.session_state.detector = TrafficAnomalyDetectorStreamlit(window_days=30)
+    st.session_state.detector = TrafficAnomalyDetectorStreamlit(window_days=30, threshold=2.5)
 
 if 'df_cargado' not in st.session_state:
     st.session_state.df_cargado = None
 
 if 'resultados' not in st.session_state:
     st.session_state.resultados = []
+
+if 'threshold_actual' not in st.session_state:
+    st.session_state.threshold_actual = 2.5
 
 
 # ============================================================================
@@ -190,7 +209,7 @@ Método elegido: eficiente, robusto y escalable.
 """)
 
 # ============================================================================
-# SIDEBAR: CARGA DE DATOS
+# SIDEBAR: CARGA DE DATOS Y PARÁMETROS
 # ============================================================================
 
 with st.sidebar:
@@ -247,16 +266,27 @@ with st.sidebar:
             
             st.session_state.df_cargado = df
             
+            # Crear nuevo detector con parámetros actuales
+            st.session_state.detector = TrafficAnomalyDetectorStreamlit(
+                window_days=st.session_state.window_days,
+                threshold=st.session_state.threshold_actual
+            )
+            
             # Entrenar detector
             stats = st.session_state.detector.cargar_historico(df)
-            st.session_state.resultados = st.session_state.detector.procesar_lote(df)
+            st.session_state.resultados = st.session_state.detector.procesar_lote(
+                df, 
+                threshold=st.session_state.threshold_actual
+            )
             
             st.success(f"✓ Datos cargados: {len(df)} registros")
             st.info(f"""
             **Baseline entrenado:**
             - Mediana: {stats['mediana']:.1f}
             - MAD: {stats['mad']:.2f}
-            - Ventana: {st.session_state.detector.window_days} días
+            - Ventana: {st.session_state.window_days} días
+            - Threshold: {st.session_state.threshold_actual:.1f} MADs
+            - Anomalías detectadas: {len(st.session_state.detector.anomalias_detectadas)}
             """)
             
         except Exception as e:
@@ -271,10 +301,11 @@ with st.sidebar:
         "Threshold (MADs):",
         min_value=1.5,
         max_value=5.0,
-        value=2.5,
-        step=0.5,
+        value=st.session_state.threshold_actual,
+        step=0.1,
         help="Mayor = menos sensible, menos falsos positivos"
     )
+    st.session_state.threshold_actual = threshold
     
     window_days = st.slider(
         "Ventana histórica (días):",
@@ -284,8 +315,7 @@ with st.sidebar:
         step=7,
         help="Datos para calcular baseline"
     )
-    
-    st.session_state.detector.window_days = window_days
+    st.session_state.window_days = window_days
     
     st.divider()
     
@@ -314,6 +344,7 @@ with st.sidebar:
         st.text(f"""
 Mediana: {stats['baseline_mediana']:.1f}
 MAD: {stats['baseline_mad']:.2f}
+Threshold: {threshold:.1f}
 Edad baseline: {stats['baseline_edad_horas']:.1f}h
         """)
 
@@ -386,15 +417,16 @@ else:
         )
         
         # Bandas ±MAD
+        threshold_val = st.session_state.threshold_actual
         fig.add_hline(
-            y=detector.baseline_med + 2.5 * detector.baseline_mad,
+            y=detector.baseline_med + threshold_val * detector.baseline_mad,
             line_dash="dot",
             line_color="orange",
             opacity=0.5
         )
         
         fig.add_hline(
-            y=detector.baseline_med - 2.5 * detector.baseline_mad,
+            y=detector.baseline_med - threshold_val * detector.baseline_mad,
             line_dash="dot",
             line_color="orange",
             opacity=0.5
@@ -428,10 +460,10 @@ else:
         
         # Línea threshold
         fig2.add_hline(
-            y=2.5,
+            y=threshold_val,
             line_dash="dash",
             line_color="red",
-            annotation_text="Threshold",
+            annotation_text=f"Threshold ({threshold_val:.1f})",
             annotation_position="right"
         )
         
@@ -576,8 +608,8 @@ else:
             )
             
             st.metric(
-                "Threshold",
-                f"{2.5:.1f} MADs",
+                "Threshold Actual",
+                f"{threshold_val:.1f} MADs",
                 help="Umbral de anomalía"
             )
         
@@ -623,8 +655,8 @@ else:
         bandas = [
             ("< 1 MAD", 0, 1),
             ("1-2 MADs", 1, 2),
-            ("2-2.5 MADs", 2, 2.5),
-            ("> 2.5 MADs (Anomalías)", 2.5, float('inf'))
+            ("2-3 MADs", 2, 3),
+            (f"> {threshold_val:.1f} MADs (Anomalías)", threshold_val, float('inf'))
         ]
         
         for nombre, min_dev, max_dev in bandas:
@@ -641,53 +673,23 @@ else:
         st.subheader("Información del Sistema")
         
         st.write("### Método Utilizado")
-        st.markdown("""
+        st.markdown(f"""
         **MAD Ventana Móvil + Modified Z-Score**
         
-        - **Ventana histórica**: 30-45 días (datos recientes)
+        - **Ventana histórica**: {window_days} días
         - **Algoritmo**: Median Absolute Deviation
-        - **Threshold**: 2.5 MADs desde la mediana
+        - **Threshold actual**: {threshold_val:.1f} MADs
         - **Complejidad**: O(1) por punto
         - **Latencia**: <0.1ms
-        - **Robustez**: Muy alta (resiste outliers históricos)
+        - **Robustez**: Muy alta (resiste outliers)
         """)
         
-        st.write("### Archivos de Datos Disponibles")
-        
-        archivos = {
-            'trafico_normal.csv': '30 días sin incidencias - patrón típico',
-            'trafico_con_incidencias.csv': '3 incidencias puntuales simuladas',
-            'trafico_cambio_gradual.csv': 'Cambio gradual +40% (obra simulada)',
-            'trafico_ruido_alto.csv': 'Ruido σ=30% (sensores defectuosos)',
-            'trafico_ultimas_24h.csv': 'Últimas 24h + 1 anomalía'
-        }
-        
-        for archivo, descripcion in archivos.items():
-            st.write(f"- **{archivo}**: {descripcion}")
-        
-        st.write("### Ecuaciones Utilizadas")
-        
-        st.markdown(r"""
-        **Mediana Absoluta Desviación (MAD):**
-        $$\text{MAD} = \text{mediana}(|x_i - \text{mediana}|)$$
-        
-        **Score de Anomalía:**
-        $$\text{score} = \frac{|x_i - \text{mediana}|}{\text{MAD}}$$
-        
-        **Decisión:**
-        $$\text{anomalía} = \text{score} > 2.5$$
-        
-        **Confianza:**
-        $$\text{confianza} = \min\left(\frac{\text{score}}{2.5}, 1.0\right)$$
+        st.write("### Parámetros Actuales")
+        st.write(f"""
+        - Mediana: {detector.baseline_med:.1f} veh/min
+        - MAD: {detector.baseline_mad:.2f} veh/min
+        - Rango ±{threshold_val} MAD: [{detector.baseline_med - threshold_val * detector.baseline_mad:.1f} - {detector.baseline_med + threshold_val * detector.baseline_mad:.1f}] veh/min
         """)
-        
-        st.write("### Parámetros Recomendados")
-        
-        st.dataframe(pd.DataFrame({
-            'Parámetro': ['Threshold (MADs)', 'Ventana (días)', 'Actualización baseline'],
-            'Valor': ['2.5', '30-45', '1x/día'],
-            'Rango': ['1.5-5.0', '7-90', 'Configurable']
-        }), use_container_width=True, hide_index=True)
 
 
 # ============================================================================
@@ -714,12 +716,12 @@ with col2:
 
 with col3:
     st.write("### ⚙️ Sistema")
-    st.write(f"Threshold: 2.5 MADs")
+    st.write(f"Threshold: {st.session_state.threshold_actual:.1f} MADs")
     st.write(f"Método: MAD Ventana Móvil")
 
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666; font-size: 0.9em;">
-Detector de Anomalías en Tráfico v1.0 | Método: MAD Ventana Móvil
+Detector de Anomalías en Tráfico v2.0 CORREGIDA | Método: MAD Ventana Móvil
 </div>
 """, unsafe_allow_html=True)
