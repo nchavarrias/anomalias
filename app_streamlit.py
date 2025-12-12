@@ -63,7 +63,7 @@ class TrafficAnomalyDetectorMAD:
     Usa solo los últimos `window_days` días del dataset para calcular baseline.[web:29][web:121]
     """
 
-    def __init__(self, window_days=30, threshold=2.5):
+    def __init__(self, window_days=42, threshold=3.5):
         self.window_days = window_days
         self.window_minutos = window_days * 1440
         self.threshold = threshold
@@ -294,10 +294,10 @@ if "resultados" not in st.session_state:
     st.session_state.resultados = []
 
 if "threshold_actual" not in st.session_state:
-    st.session_state.threshold_actual = 2.5
+    st.session_state.threshold_actual = 3.5
 
 if "window_days" not in st.session_state:
-    st.session_state.window_days = 30
+    st.session_state.window_days = 42
 
 if "contamination_iforest" not in st.session_state:
     st.session_state.contamination_iforest = 0.01
