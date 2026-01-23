@@ -3,8 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime
-from collections import deque
 import warnings
 
 from sklearn.ensemble import IsolationForest  # Isolation Forest
@@ -103,7 +103,7 @@ class TrafficAnomalyDetectorMAD:
     - minute: 0..1439
     """
 
-    def __init__(self, window_days=42, threshold=3.5, mad_floor=1.5, min_obs_per_bucket=7):
+    def __init__(self, window_days=42, threshold=3.5, mad_floor=0.5, min_obs_per_bucket=14):
         self.window_days = int(window_days)
         self.window_minutos = self.window_days * 1440
         self.threshold = float(threshold)
@@ -345,18 +345,13 @@ class TrafficAnomalyDetectorMAD:
 class TrafficAnomalyDetectorIForest:
     """
     Detector de anomalías basado en Isolation Forest (sklearn).
-
-    - Entrena un bosque de árboles que aíslan puntos "raros".
-    - Devuelve score (cuanto más negativo, más anómalo) y etiqueta.
     """
 
     def __init__(self, contamination=0.01, random_state=42):
         self.contamination = contamination
         self.random_state = random_state
-
         self.modelo = None
         self.fitted = False
-
         self.anomalias_detectadas = []
         self.score_history = []
 
@@ -364,44 +359,34 @@ class TrafficAnomalyDetectorIForest:
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
-
         X = df[["intensity"]].values
-
         self.modelo = IsolationForest(
             contamination=self.contamination,
             random_state=self.random_state,
         )
         self.modelo.fit(X)
         self.fitted = True
-
         return {"puntos": len(df)}
 
     def procesar_lote(self, df: pd.DataFrame):
         if not self.fitted or self.modelo is None:
             return []
-
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
-
         X = df[["intensity"]].values
-
         y_pred = self.modelo.predict(X)
-        scores = self.modelo.score_samples(X)  # mayor = más normal, más bajo = más raro
-
+        scores = self.modelo.score_samples(X)
         resultados = []
         self.anomalias_detectadas = []
         self.score_history = []
-
         score_min = scores.min()
         score_max = scores.max()
         denom = score_max - score_min if score_max > score_min else 1.0
         scores_norm = (scores - score_min) / denom
-
         for idx, row in enumerate(df.itertuples(index=False)):
             es_anomalia = y_pred[idx] == -1
-            score_norm = 1.0 - scores_norm[idx]  # 0 normal, 1 muy raro
-
+            score_norm = 1.0 - scores_norm[idx]
             res = {
                 "timestamp": row.timestamp,
                 "intensity": row.intensity,
@@ -410,12 +395,10 @@ class TrafficAnomalyDetectorIForest:
                 "es_anomalia": bool(es_anomalia),
                 "confianza": float(score_norm),
             }
-
             resultados.append(res)
             self.score_history.append(res)
             if es_anomalia:
                 self.anomalias_detectadas.append(res)
-
         return resultados
 
     def get_estadisticas(self):
@@ -471,10 +454,8 @@ class TrafficAnomalyDetectorRCF:
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
-
         values = df["intensity"].astype(float).values
         ts = df["timestamp"].values
-
         if self.shingle_size > 1:
             shingled = rrcf.shingle(values, size=self.shingle_size)
             X = np.vstack([v for v in shingled])
@@ -489,17 +470,13 @@ class TrafficAnomalyDetectorRCF:
         if not RRCF_AVAILABLE:
             self.fitted = False
             return {"puntos": len(df), "nota": "rrcf/rrcf2 no disponible"}
-
         np.random.seed(self.random_state)
-
         X, ts, intens = self._make_series(df)
         n = len(X)
         if n == 0:
             self.fitted = False
             return {"puntos": 0}
-
         tree_size = min(self.tree_size, n)
-
         self.forest = []
         self.tree_leaves_indexsets = []
         for _ in range(self.n_trees):
@@ -509,25 +486,20 @@ class TrafficAnomalyDetectorRCF:
                 tree.insert_point(X[j], index=j)
             self.forest.append(tree)
             self.tree_leaves_indexsets.append(set(tree.leaves.keys()))
-
         self.timestamps_ = ts
         self.intensities_ = intens
         self.fitted = True
-
         return {"puntos": n}
 
     def procesar_lote(self, df: pd.DataFrame):
         if not self.fitted or not self.forest:
             return []
-
         X, ts, intens = self._make_series(df)
         n = len(X)
         if n == 0:
             return []
-
         scores = np.zeros(n, dtype=float)
         counts = np.zeros(n, dtype=int)
-
         for t_idx, tree in enumerate(self.forest):
             leaves_set = self.tree_leaves_indexsets[t_idx]
             for i in leaves_set:
@@ -535,27 +507,21 @@ class TrafficAnomalyDetectorRCF:
                     cod = tree.codisp(i)
                     scores[i] += cod
                     counts[i] += 1
-
         mask = counts > 0
         scores[mask] = scores[mask] / counts[mask]
-
         smin, smax = float(scores.min()), float(scores.max())
         denom = (smax - smin) if smax > smin else 1.0
         scores_norm = (scores - smin) / denom
-
         if n > 1:
             perc = 100.0 * (1.0 - self.contamination)
             thr = float(np.percentile(scores_norm, perc))
         else:
             thr = 1.0
-
         self.threshold_score_norm_ = thr
         self.scores_norm_ = scores_norm
-
         resultados = []
         self.anomalias_detectadas = []
         self.score_history = []
-
         for i in range(n):
             es_anomalia = scores_norm[i] >= thr
             res = {
@@ -570,7 +536,6 @@ class TrafficAnomalyDetectorRCF:
             self.score_history.append(res)
             if es_anomalia:
                 self.anomalias_detectadas.append(res)
-
         return resultados
 
     def get_estadisticas(self):
@@ -613,6 +578,13 @@ if "window_days" not in st.session_state:
 if "contamination_iforest" not in st.session_state:
     st.session_state.contamination_iforest = 0.01
 
+# Estados MAD extra
+if "mad_floor" not in st.session_state:
+    st.session_state.mad_floor = 1.5  # recomendación práctica
+
+if "min_obs_per_bucket" not in st.session_state:
+    st.session_state.min_obs_per_bucket = 7  # ~1 ciclo semanal por bucket
+
 # Estados para RCF
 if "rcf_n_trees" not in st.session_state:
     st.session_state.rcf_n_trees = 100
@@ -640,6 +612,43 @@ Compara tres algoritmos de detección de anomalías:
 - **Random Cut Forest** (bosque de cortes aleatorios con score de codisp).
 """
 )
+
+# ============================================================================
+# UTILS: POST-REGLA POR SEGMENTOS (para MAD)
+# ============================================================================
+
+def _filtrar_por_segmentos(df_res: pd.DataFrame, min_consec=5, tolerancia=1):
+    """
+    Mantiene como anomalías solo segmentos con >= min_consec minutos por encima del umbral,
+    permitiendo 'tolerancia' minutos intermedios no anómalos.
+    df_res: DataFrame con columnas ['timestamp','es_anomalia'] ya ordenado por tiempo.
+    """
+    if df_res.empty:
+        return df_res
+
+    df = df_res.copy().sort_values("timestamp").reset_index(drop=True)
+    keep = np.zeros(len(df), dtype=bool)
+    i, n = 0, len(df)
+    while i < n:
+        if not df.loc[i, "es_anomalia"]:
+            i += 1
+            continue
+        j = i
+        gaps = 0
+        consec = 0
+        while j < n:
+            if df.loc[j, "es_anomalia"]:
+                consec += 1
+            else:
+                gaps += 1
+                if gaps > tolerancia:
+                    break
+            j += 1
+        if consec >= min_consec:
+            keep[i:j] = True
+        i = j
+    df["es_anomalia"] = keep
+    return df
 
 # ============================================================================
 # SIDEBAR
@@ -724,7 +733,6 @@ with st.sidebar:
             if df is not None:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 df = df.sort_values("timestamp").reset_index(drop=True)
-
                 st.session_state.df_cargado = df
 
                 # Crear detector según algoritmo
@@ -732,18 +740,34 @@ with st.sidebar:
                     st.session_state.detector = TrafficAnomalyDetectorMAD(
                         window_days=st.session_state.window_days,
                         threshold=st.session_state.threshold_actual,
+                        mad_floor=st.session_state.mad_floor,
+                        min_obs_per_bucket=st.session_state.min_obs_per_bucket,
                     )
                     with st.spinner("Entrenando MAD estacional (dow+minuto)…"):
                         stats_base = st.session_state.detector.cargar_historico(df)
                     with st.spinner("Calculando scores (MAD)…"):
-                        st.session_state.resultados = st.session_state.detector.procesar_lote(
+                        resultados = st.session_state.detector.procesar_lote(
                             df, threshold=st.session_state.threshold_actual
                         )
+                    df_res = pd.DataFrame(resultados)
+                    if not df_res.empty:
+                        df_res["timestamp"] = pd.to_datetime(df_res["timestamp"])
+                        df_res = _filtrar_por_segmentos(df_res, min_consec=5, tolerancia=1)
+                        # Guardar back en los estados del detector
+                        st.session_state.detector.anomalias_detectadas = [
+                            r for r in df_res.to_dict(orient="records") if r["es_anomalia"]
+                        ]
+                        st.session_state.detector.score_history = df_res.to_dict(orient="records")
+                        st.session_state.resultados = df_res.to_dict(orient="records")
+                    else:
+                        st.session_state.resultados = resultados
+
                     st.success(
                         "MAD estacional (dow+minuto) entrenado con "
                         f"{stats_base['puntos']} puntos — buckets válidos ≈ {stats_base['buckets_validos_pct']:.1f}% — "
                         f"MAD mediano global ≈ {stats_base['mad_mediano_global']:.2f}"
                     )
+
                 elif algoritmo.startswith("Isolation"):
                     st.session_state.detector = TrafficAnomalyDetectorIForest(
                         contamination=st.session_state.contamination_iforest
@@ -807,6 +831,27 @@ with st.sidebar:
             step=0.1,
         )
         st.session_state.threshold_actual = threshold
+
+        # NUEVOS: mad_floor y min_obs_per_bucket
+        mad_floor = st.slider(
+            "Suelo de MAD (mad_floor):",
+            min_value=0.0,
+            max_value=5.0,
+            value=st.session_state.mad_floor,
+            step=0.5,
+            help="MAD mínimo por bucket. Sube si ves puntitos sueltos o madrugada nerviosa."
+        )
+        st.session_state.mad_floor = mad_floor
+
+        min_obs = st.slider(
+            "Observaciones mínimas por bucket (dow, minuto):",
+            min_value=1,
+            max_value=60,
+            value=st.session_state.min_obs_per_bucket,
+            step=1,
+            help="Si un bucket tiene menos observaciones en la ventana, se usa el fallback por minuto del día."
+        )
+        st.session_state.min_obs_per_bucket = min_obs
 
     elif algoritmo.startswith("Isolation"):
         contamination = st.slider(
@@ -874,13 +919,29 @@ with st.sidebar:
                 st.session_state.detector = TrafficAnomalyDetectorMAD(
                     window_days=st.session_state.window_days,
                     threshold=st.session_state.threshold_actual,
+                    mad_floor=st.session_state.mad_floor,
+                    min_obs_per_bucket=st.session_state.min_obs_per_bucket,
                 )
                 with st.spinner("Entrenando MAD estacional (dow+minuto)…"):
                     stats_base = st.session_state.detector.cargar_historico(df)
                 with st.spinner("Calculando scores (MAD)…"):
-                    st.session_state.resultados = st.session_state.detector.procesar_lote(
+                    resultados = st.session_state.detector.procesar_lote(
                         df, threshold=st.session_state.threshold_actual
                     )
+
+                # POST-REGLA: segmentos
+                df_res = pd.DataFrame(resultados)
+                if not df_res.empty:
+                    df_res["timestamp"] = pd.to_datetime(df_res["timestamp"])
+                    df_res = _filtrar_por_segmentos(df_res, min_consec=5, tolerancia=1)
+                    st.session_state.detector.anomalias_detectadas = [
+                        r for r in df_res.to_dict(orient="records") if r["es_anomalia"]
+                    ]
+                    st.session_state.detector.score_history = df_res.to_dict(orient="records")
+                    st.session_state.resultados = df_res.to_dict(orient="records")
+                else:
+                    st.session_state.resultados = resultados
+
                 st.success(
                     "MAD estacional (dow+minuto) recalculado — "
                     f"puntos={stats_base['puntos']}, buckets válidos ≈ {stats_base['buckets_validos_pct']:.1f}%, "
@@ -914,7 +975,7 @@ with st.sidebar:
                     )
                     with st.spinner(f"Entrenando Random Cut Forest (backend: {RRCF_BACKEND})..."):
                         stats_base = st.session_state.detector.cargar_historico(df)
-                    with st.spinner("Calculando scores (RCF)..."):
+                    with st.spinner("Calculando scores (RCF)…"):
                         st.session_state.resultados = st.session_state.detector.procesar_lote(df)
                     st.success(
                         f"Random Cut Forest recalculado (puntos={stats_base['puntos']}, "
@@ -994,8 +1055,8 @@ else:
                     )
                 )
 
-            # NOTA: En el nuevo MAD estacional la baseline cambia por minuto,
-            # así que no dibujamos líneas horizontales de baseline/bandas.
+            # En el MAD estacional la baseline cambia por minuto,
+            # no dibujamos líneas horizontales de baseline/bandas.
 
             fig.update_layout(
                 title=f"Intensidad - Algoritmo: {st.session_state.algoritmo}",
@@ -1084,6 +1145,7 @@ else:
     # ---------- TAB 3: ANÁLISIS ----------
     with tab3:
         st.subheader("Análisis")
+
         if isinstance(detector, TrafficAnomalyDetectorMAD):
             stats = detector.get_estadisticas()
             col1, col2 = st.columns(2)
@@ -1099,6 +1161,46 @@ else:
             with col2:
                 st.metric("Threshold", f"{st.session_state.threshold_actual:.1f} MADs")
                 st.metric("Ventana", f"{st.session_state.window_days} días")
+
+            st.markdown("### Heatmap de tasa de anomalías (dow × minuto)")
+            if not df_res.empty:
+                df_hm = df_res.copy()
+                df_hm["dow"] = df_hm["timestamp"].dt.weekday
+                df_hm["minute"] = df_hm["timestamp"].dt.hour*60 + df_hm["timestamp"].dt.minute
+                rate = (df_hm.groupby(["dow","minute"])["es_anomalia"]
+                              .mean()
+                              .unstack(0)  # columnas = dow
+                              .fillna(0.0))
+                fig_hm = px.imshow(
+                    rate.values.T,
+                    aspect="auto",
+                    origin="lower",
+                    labels=dict(x="Minuto del día (0..1439)", y="Día semana (0=L..6=D)", color="Tasa anómala"),
+                    x=rate.index, y=list(range(7)),
+                    color_continuous_scale="Viridis",
+                )
+                fig_hm.update_layout(height=300)
+                st.plotly_chart(fig_hm, width="stretch")
+
+                with st.expander("¿Qué aporta el heatmap y cómo interpretarlo?"):
+                    st.markdown(
+                        """
+**¿Qué es?**  
+Un mapa de calor que muestra, para cada **día de la semana (0=Lunes..6=Domingo)** y cada **minuto del día (0..1439)**, la **proporción de puntos** que el MAD estacional ha marcado como anómalos.
+
+**¿Para qué sirve?**  
+- Detecta **patrones sistemáticos** de falsas alarmas (franjas verticales cada mañana/tarde ⇒ threshold o `mad_floor` demasiado bajos).  
+- Destaca **zonas localizadas** donde realmente hay eventos (manchas aisladas y no repetitivas).
+
+**Cómo leerlo:**
+- **Franjas amplias** y repetidas ⇒ el umbral es aún laxo para ese intervalo. Sube **Threshold** (p. ej., 4.0→4.5) o aumenta **mad_floor** (p. ej., 1.5→2.0).  
+- **Manchas pequeñas** y concretas ⇒ eventos **reales** (accidentes, spikes, cortes), buen comportamiento.  
+- **Zonas uniformemente azules (≈0%)** ⇒ normalidad estable para ese (dow, minuto).
+"""
+                    )
+            else:
+                st.info("No hay resultados para construir el heatmap.")
+
         elif isinstance(detector, TrafficAnomalyDetectorRCF):
             col1, col2 = st.columns(2)
             with col1:
@@ -1164,13 +1266,11 @@ Comparas cada punto con su “normal” del **mismo minuto del día** y **mismo 
 - \(\varepsilon\) evita divisiones por cero (suelo de MAD).
 - Umbral en **MADs** (p. ej., 3.5).
 
-### Por qué funciona mejor en tráfico
-La noche no “tira” de la mediana diaria: los picos de las 08:15 se comparan con otras 08:15 históricas, no con las 03:00.
-
 ### Consejos
 - **Ventana**: 42–56 días.
-- **Threshold**: 3.5 (sube a 4.0–4.5 si hay demasiadas alertas).
-- **Segmentos**: considera agrupar alertas si hay ≥5 minutos consecutivos (post-regla operativa).
+- **Threshold**: 3.5–4.5 según sensibilidad.
+- **Suelo (mad_floor)**: 1.5–2.0 si hay minutos muy estables.
+- **Segmentos**: agrupa anomalías si hay ≥5 minutos consecutivos (limpia puntitos sueltos).
 """
             )
 
@@ -1224,4 +1324,3 @@ Algoritmo seleccionado: <b>{st.session_state.algoritmo}</b> — {desc_corta}
 """,
     unsafe_allow_html=True,
 )
-
