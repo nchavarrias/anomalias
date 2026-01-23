@@ -572,6 +572,14 @@ with st.sidebar:
         "Cambio Gradual (Obra)",
         "Ruido Alto (Sensores malos)",
         "Últimas 24 horas + Anomalía",
+        
+        # NUEVOS DE 120 DÍAS
+        "Accidente (4 eventos, 120 días)",
+        "Evento Estadio (3 eventos, 120 días)",
+        "Puente/Festivo (120 días)",
+        "Desvío Temporal (2 semanas, 120 días)",
+        "Corte Nocturno por Obras (120 días)",
+        "Sensor Defectuoso (120 días)",
     ]
 
     dataset_seleccionado = st.selectbox("Dataset:", datasets_disponibles)
@@ -581,8 +589,14 @@ with st.sidebar:
         "Con Incidencias (3 eventos)": "datos_trafico/trafico_con_incidencias.csv",
         "Cambio Gradual (Obra)": "datos_trafico/trafico_cambio_gradual.csv",
         "Ruido Alto (Sensores malos)": "datos_trafico/trafico_ruido_alto.csv",
-        "Últimas 24 horas + Anomalía": "datos_trafico/trafico_ultimas_24h.csv",
-    }
+        "Últimas 24 horas + Anomalía": "datos_trafico/trafico_ultimas_24h.csv",        
+        "Accidente (4 eventos, 120 días)": "datos_trafico/trafico_accidente_4eventos_120d.csv",
+        "Evento Estadio (3 eventos, 120 días)": "datos_trafico/trafico_evento_estadio_3eventos_120d.csv",
+        "Puente/Festivo (120 días)": "datos_trafico/trafico_puente_festivo_120d.csv",
+        "Desvío Temporal (2 semanas, 120 días)": "datos_trafico/trafico_desvio_semana_120d.csv",
+        "Corte Nocturno por Obras (120 días)": "datos_trafico/trafico_corte_nocturno_120d.csv",
+        "Sensor Defectuoso (120 días)": "datos_trafico/trafico_sensor_defectuoso_120d.csv",
+   }
 
     if dataset_seleccionado == "Subir CSV personalizado":
         archivo_cargado = st.file_uploader(
