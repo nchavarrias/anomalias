@@ -1,3 +1,3 @@
 
 # TODO
-- [ ] Añadir Random Cut Forest
+- [x] Añadir Random Cut Forest
