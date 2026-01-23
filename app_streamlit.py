@@ -837,7 +837,7 @@ else:
                 height=500,
                 template="plotly_white",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
             # Score
             st.subheader("Score de Anomalía")
@@ -886,7 +886,7 @@ else:
                 height=400,
                 template="plotly_white",
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
     # ---------- TAB 2: ANOMALÍAS ----------
     with tab2:
@@ -907,7 +907,7 @@ else:
                     ).round(0).astype(int).astype(str)
                     + "%",
                 ),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
         else:
