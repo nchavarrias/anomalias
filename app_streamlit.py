@@ -162,6 +162,9 @@ class TrafficAnomalyDetectorMAD:
             if r is not None:
                 resultados.append(r)
 
+            # (opcional: actualizar baseline dinámico con ventana deslizante)
+            # No lo hacemos para mantener baseline estable del histórico.
+
         return resultados
 
     def get_estadisticas(self):
@@ -551,57 +554,62 @@ with st.sidebar:
             if isinstance(archivo_usar, str):
                 df = pd.read_csv(archivo_usar)
             else:
-                df = pd.read_csv(archivo_usar)
-
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df = df.sort_values("timestamp").reset_index(drop=True)
-
-            st.session_state.df_cargado = df
-
-            # Crear detector según algoritmo
-            if algoritmo.startswith("MAD"):
-                st.session_state.detector = TrafficAnomalyDetectorMAD(
-                    window_days=st.session_state.window_days,
-                    threshold=st.session_state.threshold_actual,
-                )
-                stats_base = st.session_state.detector.cargar_historico(df)
-                st.session_state.resultados = st.session_state.detector.procesar_lote(
-                    df, threshold=st.session_state.threshold_actual
-                )
-                st.success(
-                    f"MAD entrenado con {stats_base['puntos']} puntos "
-                    f"(mediana={stats_base['mediana']:.1f}, MAD={stats_base['mad']:.2f})"
-                )
-            elif algoritmo.startswith("Isolation"):
-                st.session_state.detector = TrafficAnomalyDetectorIForest(
-                    contamination=st.session_state.contamination_iforest
-                )
-                stats_base = st.session_state.detector.cargar_historico(df)
-                st.session_state.resultados = st.session_state.detector.procesar_lote(df)
-                st.success(
-                    f"Isolation Forest entrenado con {stats_base['puntos']} puntos, "
-                    f"contamination={st.session_state.contamination_iforest:.3f}"
-                )
-            else:
-                # Random Cut Forest
-                if not RRCF_AVAILABLE:
-                    st.session_state.detector = None
-                    st.session_state.resultados = []
-                    st.error("❌ RCF requiere la librería 'rrcf'. Instálala con: pip install rrcf")
+                if archivo_usar is None:
+                    st.warning("⚠️ Selecciona un archivo CSV para cargar.")
+                    df = None
                 else:
-                    st.session_state.detector = TrafficAnomalyDetectorRCF(
-                        n_trees=st.session_state.rcf_n_trees,
-                        tree_size=st.session_state.rcf_tree_size,
-                        shingle_size=st.session_state.rcf_shingle,
-                        contamination=st.session_state.contamination_rcf,
+                    df = pd.read_csv(archivo_usar)
+
+            if df is not None:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df.sort_values("timestamp").reset_index(drop=True)
+
+                st.session_state.df_cargado = df
+
+                # Crear detector según algoritmo
+                if algoritmo.startswith("MAD"):
+                    st.session_state.detector = TrafficAnomalyDetectorMAD(
+                        window_days=st.session_state.window_days,
+                        threshold=st.session_state.threshold_actual,
+                    )
+                    stats_base = st.session_state.detector.cargar_historico(df)
+                    st.session_state.resultados = st.session_state.detector.procesar_lote(
+                        df, threshold=st.session_state.threshold_actual
+                    )
+                    st.success(
+                        f"MAD entrenado con {stats_base['puntos']} puntos "
+                        f"(mediana={stats_base['mediana']:.1f}, MAD={stats_base['mad']:.2f})"
+                    )
+                elif algoritmo.startswith("Isolation"):
+                    st.session_state.detector = TrafficAnomalyDetectorIForest(
+                        contamination=st.session_state.contamination_iforest
                     )
                     stats_base = st.session_state.detector.cargar_historico(df)
                     st.session_state.resultados = st.session_state.detector.procesar_lote(df)
                     st.success(
-                        f"Random Cut Forest entrenado con {stats_base['puntos']} puntos, "
-                        f"árboles={st.session_state.rcf_n_trees}, tamaño árbol={st.session_state.rcf_tree_size}, "
-                        f"shingle={st.session_state.rcf_shingle}, contamination={st.session_state.contamination_rcf:.3f}"
+                        f"Isolation Forest entrenado con {stats_base['puntos']} puntos, "
+                        f"contamination={st.session_state.contamination_iforest:.3f}"
                     )
+                else:
+                    # Random Cut Forest
+                    if not RRCF_AVAILABLE:
+                        st.session_state.detector = None
+                        st.session_state.resultados = []
+                        st.error("❌ RCF requiere la librería 'rrcf'. Instálala con: pip install rrcf")
+                    else:
+                        st.session_state.detector = TrafficAnomalyDetectorRCF(
+                            n_trees=st.session_state.rcf_n_trees,
+                            tree_size=st.session_state.rcf_tree_size,
+                            shingle_size=st.session_state.rcf_shingle,
+                            contamination=st.session_state.contamination_rcf,
+                        )
+                        stats_base = st.session_state.detector.cargar_historico(df)
+                        st.session_state.resultados = st.session_state.detector.procesar_lote(df)
+                        st.success(
+                            f"Random Cut Forest entrenado con {stats_base['puntos']} puntos, "
+                            f"árboles={st.session_state.rcf_n_trees}, tamaño árbol={st.session_state.rcf_tree_size}, "
+                            f"shingle={st.session_state.rcf_shingle}, contamination={st.session_state.contamination_rcf:.3f}"
+                        )
 
         except Exception as e:
             st.error(f"❌ Error cargando datos: {str(e)}")
@@ -837,7 +845,7 @@ else:
                 height=500,
                 template="plotly_white",
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, width="stretch")
 
             # Score
             st.subheader("Score de Anomalía")
@@ -886,7 +894,7 @@ else:
                 height=400,
                 template="plotly_white",
             )
-            st.plotly_chart(fig2, width='stretch')
+            st.plotly_chart(fig2, width="stretch")
 
     # ---------- TAB 2: ANOMALÍAS ----------
     with tab2:
@@ -907,7 +915,7 @@ else:
                     ).round(0).astype(int).astype(str)
                     + "%",
                 ),
-                width='stretch',
+                width="stretch",
                 hide_index=True,
             )
         else:
