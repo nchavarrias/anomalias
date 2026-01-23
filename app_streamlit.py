@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,7 +6,14 @@ import plotly.graph_objects as go
 from datetime import datetime
 from collections import deque
 
-from sklearn.ensemble import IsolationForest  # Isolation Forest[web:143]
+from sklearn.ensemble import IsolationForest  # Isolation Forest
+
+# Random Cut Forest (rrcf)
+try:
+    import rrcf
+    RRCF_AVAILABLE = True
+except Exception:
+    RRCF_AVAILABLE = False
 
 # ============================================================================
 # CONFIGURACIÓN STREAMLIT
@@ -60,7 +68,7 @@ class TrafficAnomalyDetectorMAD:
     - Score = |x - baseline| / MAD
     - Anomalía si score > threshold
 
-    Usa solo los últimos `window_days` días del dataset para calcular baseline.[web:29][web:121]
+    Usa solo los últimos `window_days` días del dataset para calcular baseline.
     """
 
     def __init__(self, window_days=42, threshold=3.5):
@@ -182,7 +190,7 @@ class TrafficAnomalyDetectorMAD:
 
 class TrafficAnomalyDetectorIForest:
     """
-    Detector de anomalías basado en Isolation Forest (sklearn).[web:140][web:143]
+    Detector de anomalías basado en Isolation Forest (sklearn).
 
     - Entrena un bosque de árboles que aíslan puntos "raros".
     - Devuelve score (cuanto más negativo, más anómalo) y etiqueta.
@@ -201,11 +209,11 @@ class TrafficAnomalyDetectorIForest:
     def cargar_historico(self, df: pd.DataFrame):
         """
         Entrena el IsolationForest sobre las features disponibles.
-        Aquí usamos solo intensity, pero puedes añadir occupancy, etc.[web:17][web:146]
+        Aquí usamos solo intensity, pero puedes añadir occupancy, etc.
         """
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values("timestamp")
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
         X = df[["intensity"]].values  # extender con más features si quieres
 
@@ -224,13 +232,13 @@ class TrafficAnomalyDetectorIForest:
 
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values("timestamp")
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
         X = df[["intensity"]].values
 
         # predict: 1 = normal, -1 = anomalía
         y_pred = self.modelo.predict(X)
-        scores = self.modelo.score_samples(X)  # mayor = más normal, más bajo = más raro[web:140]
+        scores = self.modelo.score_samples(X)  # mayor = más normal, más bajo = más raro
 
         resultados = []
         self.anomalias_detectadas = []
@@ -242,17 +250,17 @@ class TrafficAnomalyDetectorIForest:
         denom = score_max - score_min if score_max > score_min else 1.0
         scores_norm = (scores - score_min) / denom
 
-        for i, row in df.iterrows():
-            es_anomalia = y_pred[i] == -1
-            score_norm = 1.0 - scores_norm[i]  # 0 normal, 1 muy raro
+        for idx, row in enumerate(df.itertuples(index=False)):
+            es_anomalia = y_pred[idx] == -1
+            score_norm = 1.0 - scores_norm[idx]  # 0 normal, 1 muy raro
 
             res = {
-                "timestamp": row["timestamp"],
-                "intensity": row["intensity"],
+                "timestamp": row.timestamp,
+                "intensity": row.intensity,
                 "expected": np.nan,  # IF no da baseline explícito
-                "score": score_norm,
-                "es_anomalia": es_anomalia,
-                "confianza": score_norm,
+                "score": float(score_norm),
+                "es_anomalia": bool(es_anomalia),
+                "confianza": float(score_norm),
             }
 
             resultados.append(res)
@@ -274,6 +282,161 @@ class TrafficAnomalyDetectorIForest:
                 if self.anomalias_detectadas
                 else None
             ),
+        }
+
+
+# ============================================================================
+# CLASE 3: DETECTOR RANDOM CUT FOREST
+# ============================================================================
+
+
+class TrafficAnomalyDetectorRCF:
+    """
+    Detector de anomalías basado en Random Cut Forest (RRCF).
+
+    - Calcula puntuación de rareza (codisp) promediada en un bosque de árboles.
+    - No da baseline explícito; devolvemos score normalizado (0 normal, 1 muy raro).
+    - La etiqueta de anomalía se decide por el percentil determinado por 'contamination'.
+    - 'shingle_size' > 1 permite captar contexto temporal (ventanas).
+    """
+
+    def __init__(self, n_trees=100, tree_size=256, shingle_size=1, contamination=0.01, random_state=42):
+        self.n_trees = int(n_trees)
+        self.tree_size = int(tree_size)
+        self.shingle_size = int(shingle_size)
+        self.contamination = float(contamination)
+        self.random_state = int(random_state)
+
+        self.forest = []
+        self.fitted = False
+
+        self.timestamps_ = None
+        self.intensities_ = None
+        self.scores_norm_ = None
+        self.threshold_score_norm_ = None  # umbral normalizado 0..1
+
+        self.anomalias_detectadas = []
+        self.score_history = []
+
+    def _make_series(self, df: pd.DataFrame):
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        values = df["intensity"].astype(float).values
+        ts = df["timestamp"].values
+
+        if self.shingle_size > 1:
+            shingled = rrcf.shingle(values, size=self.shingle_size)
+            X = np.vstack([v for v in shingled])
+            ts_adj = ts[self.shingle_size - 1 :]
+            intens_adj = values[self.shingle_size - 1 :]
+            return X, ts_adj, intens_adj
+        else:
+            X = values.reshape(-1, 1)
+            return X, ts, values
+
+    def cargar_historico(self, df: pd.DataFrame):
+        if not RRCF_AVAILABLE:
+            self.fitted = False
+            return {"puntos": len(df), "nota": "rrcf no instalado (pip install rrcf)"}
+
+        np.random.seed(self.random_state)
+
+        X, ts, intens = self._make_series(df)
+        n = len(X)
+        if n == 0:
+            self.fitted = False
+            return {"puntos": 0}
+
+        tree_size = min(self.tree_size, n)
+
+        # Construimos bosque con subconjuntos aleatorios de índices
+        self.forest = []
+        for _ in range(self.n_trees):
+            idx = np.random.choice(n, size=tree_size, replace=False)
+            tree = rrcf.RCTree()
+            for j in idx:
+                tree.insert_point(X[j], index=j)
+            self.forest.append(tree)
+
+        self.timestamps_ = ts
+        self.intensities_ = intens
+        self.fitted = True
+
+        return {"puntos": n}
+
+    def procesar_lote(self, df: pd.DataFrame):
+        if not self.fitted or not self.forest:
+            return []
+
+        X, ts, intens = self._make_series(df)
+        n = len(X)
+        if n == 0:
+            return []
+
+        scores = np.zeros(n, dtype=float)
+        for i in range(n):
+            xi = X[i]
+            total = 0.0
+            for tree in self.forest:
+                if i in tree.leaves:
+                    cod = tree.codisp(i)
+                else:
+                    # Inserción temporal para obtener codisp y no alterar el árbol
+                    tree.insert_point(xi, index=i)
+                    cod = tree.codisp(i)
+                    tree.forget_point(i)
+                total += cod
+            scores[i] = total / len(self.forest)
+
+        smin, smax = float(scores.min()), float(scores.max())
+        denom = (smax - smin) if smax > smin else 1.0
+        scores_norm = (scores - smin) / denom
+
+        if n > 1:
+            perc = 100.0 * (1.0 - self.contamination)
+            thr = float(np.percentile(scores_norm, perc))
+        else:
+            thr = 1.0
+
+        self.threshold_score_norm_ = thr
+        self.scores_norm_ = scores_norm
+
+        resultados = []
+        self.anomalias_detectadas = []
+        self.score_history = []
+
+        for i in range(n):
+            es_anomalia = scores_norm[i] >= thr
+            res = {
+                "timestamp": pd.to_datetime(ts[i]),
+                "intensity": float(intens[i]),
+                "expected": np.nan,
+                "score": float(scores_norm[i]),
+                "es_anomalia": bool(es_anomalia),
+                "confianza": float(scores_norm[i]),
+            }
+            resultados.append(res)
+            self.score_history.append(res)
+            if es_anomalia:
+                self.anomalias_detectadas.append(res)
+
+        return resultados
+
+    def get_estadisticas(self):
+        return {
+            "total_anomalias": len(self.anomalias_detectadas),
+            "baseline_mediana": np.nan,
+            "baseline_mad": np.nan,
+            "buffer_tamaño": len(self.score_history),
+            "baseline_edad_horas": None,
+            "ultima_anomalia": (
+                self.anomalias_detectadas[-1]["timestamp"]
+                if self.anomalias_detectadas
+                else None
+            ),
+            "threshold_score_norm": self.threshold_score_norm_,
         }
 
 
@@ -302,6 +465,19 @@ if "window_days" not in st.session_state:
 if "contamination_iforest" not in st.session_state:
     st.session_state.contamination_iforest = 0.01
 
+# Estados para RCF
+if "rcf_n_trees" not in st.session_state:
+    st.session_state.rcf_n_trees = 100
+
+if "rcf_tree_size" not in st.session_state:
+    st.session_state.rcf_tree_size = 256
+
+if "rcf_shingle" not in st.session_state:
+    st.session_state.rcf_shingle = 1
+
+if "contamination_rcf" not in st.session_state:
+    st.session_state.contamination_rcf = 0.01
+
 
 # ============================================================================
 # CABECERA
@@ -310,9 +486,10 @@ if "contamination_iforest" not in st.session_state:
 st.title("🚗 Detector de Anomalías en Tráfico")
 st.markdown(
     """
-Compara dos algoritmos de detección de anomalías:
-- **MAD con ventana deslizante** (robusto estadístico).[web:29][web:121]  
-- **Isolation Forest** (modelo basado en árboles de aislamiento).[web:140][web:143]
+Compara tres algoritmos de detección de anomalías:
+- **MAD con ventana deslizante** (robusto estadístico).  
+- **Isolation Forest** (modelo basado en árboles de aislamiento).  
+- **Random Cut Forest** (bosque de cortes aleatorios con score de codisp).
 """
 )
 
@@ -325,10 +502,16 @@ with st.sidebar:
 
     # Algoritmo
     st.subheader("0️⃣ Algoritmo")
+    algoritmos_lista = ["MAD (Ventana deslizante)", "Isolation Forest", "Random Cut Forest"]
+    try:
+        idx_alg = algoritmos_lista.index(st.session_state.algoritmo)
+    except ValueError:
+        idx_alg = 0
+
     algoritmo = st.selectbox(
         "Método de detección:",
-        ["MAD (Ventana deslizante)", "Isolation Forest"],
-        index=0 if st.session_state.algoritmo == "MAD (Ventana deslizante)" else 1,
+        algoritmos_lista,
+        index=idx_alg,
     )
     st.session_state.algoritmo = algoritmo
 
@@ -389,7 +572,7 @@ with st.sidebar:
                     f"MAD entrenado con {stats_base['puntos']} puntos "
                     f"(mediana={stats_base['mediana']:.1f}, MAD={stats_base['mad']:.2f})"
                 )
-            else:
+            elif algoritmo.startswith("Isolation"):
                 st.session_state.detector = TrafficAnomalyDetectorIForest(
                     contamination=st.session_state.contamination_iforest
                 )
@@ -399,6 +582,26 @@ with st.sidebar:
                     f"Isolation Forest entrenado con {stats_base['puntos']} puntos, "
                     f"contamination={st.session_state.contamination_iforest:.3f}"
                 )
+            else:
+                # Random Cut Forest
+                if not RRCF_AVAILABLE:
+                    st.session_state.detector = None
+                    st.session_state.resultados = []
+                    st.error("❌ RCF requiere la librería 'rrcf'. Instálala con: pip install rrcf")
+                else:
+                    st.session_state.detector = TrafficAnomalyDetectorRCF(
+                        n_trees=st.session_state.rcf_n_trees,
+                        tree_size=st.session_state.rcf_tree_size,
+                        shingle_size=st.session_state.rcf_shingle,
+                        contamination=st.session_state.contamination_rcf,
+                    )
+                    stats_base = st.session_state.detector.cargar_historico(df)
+                    st.session_state.resultados = st.session_state.detector.procesar_lote(df)
+                    st.success(
+                        f"Random Cut Forest entrenado con {stats_base['puntos']} puntos, "
+                        f"árboles={st.session_state.rcf_n_trees}, tamaño árbol={st.session_state.rcf_tree_size}, "
+                        f"shingle={st.session_state.rcf_shingle}, contamination={st.session_state.contamination_rcf:.3f}"
+                    )
 
         except Exception as e:
             st.error(f"❌ Error cargando datos: {str(e)}")
@@ -426,7 +629,8 @@ with st.sidebar:
             step=0.1,
         )
         st.session_state.threshold_actual = threshold
-    else:
+
+    elif algoritmo.startswith("Isolation"):
         contamination = st.slider(
             "Contamination (proporción esperada de anomalías):",
             min_value=0.001,
@@ -435,6 +639,47 @@ with st.sidebar:
             step=0.001,
         )
         st.session_state.contamination_iforest = contamination
+
+    else:
+        # Random Cut Forest
+        n_trees = st.slider(
+            "Nº de árboles (RCF):",
+            min_value=20,
+            max_value=300,
+            value=st.session_state.rcf_n_trees,
+            step=10,
+            help="Más árboles = mejor estabilidad del score, pero más lento.",
+        )
+        st.session_state.rcf_n_trees = n_trees
+
+        tree_size = st.slider(
+            "Tamaño del árbol (RCF):",
+            min_value=64,
+            max_value=1024,
+            value=st.session_state.rcf_tree_size,
+            step=64,
+            help="Número máximo de puntos por árbol (submuestreo por árbol).",
+        )
+        st.session_state.rcf_tree_size = tree_size
+
+        shingle = st.slider(
+            "Shingle size (contexto temporal):",
+            min_value=1,
+            max_value=10,
+            value=st.session_state.rcf_shingle,
+            step=1,
+            help="Usa ventanas de este tamaño para captar patrones temporales.",
+        )
+        st.session_state.rcf_shingle = shingle
+
+        contamination_rcf = st.slider(
+            "Contamination (proporción esperada de anomalías):",
+            min_value=0.001,
+            max_value=0.1,
+            value=st.session_state.contamination_rcf,
+            step=0.001,
+        )
+        st.session_state.contamination_rcf = contamination_rcf
 
     st.divider()
 
@@ -460,7 +705,7 @@ with st.sidebar:
                     f"MAD recalculado (puntos={stats_base['puntos']}, "
                     f"mediana={stats_base['mediana']:.1f}, MAD={stats_base['mad']:.2f})"
                 )
-            else:
+            elif algoritmo.startswith("Isolation"):
                 st.session_state.detector = TrafficAnomalyDetectorIForest(
                     contamination=st.session_state.contamination_iforest
                 )
@@ -470,6 +715,26 @@ with st.sidebar:
                     f"Isolation Forest recalculado (puntos={stats_base['puntos']}, "
                     f"contamination={st.session_state.contamination_iforest:.3f})"
                 )
+            else:
+                # Random Cut Forest
+                if not RRCF_AVAILABLE:
+                    st.session_state.detector = None
+                    st.session_state.resultados = []
+                    st.error("❌ RCF requiere la librería 'rrcf'. Instálala con: pip install rrcf")
+                else:
+                    st.session_state.detector = TrafficAnomalyDetectorRCF(
+                        n_trees=st.session_state.rcf_n_trees,
+                        tree_size=st.session_state.rcf_tree_size,
+                        shingle_size=st.session_state.rcf_shingle,
+                        contamination=st.session_state.contamination_rcf,
+                    )
+                    stats_base = st.session_state.detector.cargar_historico(df)
+                    st.session_state.resultados = st.session_state.detector.procesar_lote(df)
+                    st.success(
+                        f"Random Cut Forest recalculado (puntos={stats_base['puntos']}, "
+                        f"árboles={st.session_state.rcf_n_trees}, tamaño árbol={st.session_state.rcf_tree_size}, "
+                        f"shingle={st.session_state.rcf_shingle}, contamination={st.session_state.contamination_rcf:.3f})"
+                    )
 
     st.divider()
 
@@ -599,6 +864,17 @@ else:
                     annotation_position="right",
                 )
                 y_title = "Score (MADs desde baseline)"
+            elif isinstance(detector, TrafficAnomalyDetectorRCF):
+                thr = getattr(detector, "threshold_score_norm_", None)
+                if thr is not None:
+                    fig2.add_hline(
+                        y=thr,
+                        line_dash="dash",
+                        line_color="red",
+                        annotation_text=f"Umbral (1 - contamination) = {thr:.2f}",
+                        annotation_position="right",
+                    )
+                y_title = "Score normalizado (0 normal, 1 muy raro) — RCF"
             else:
                 y_title = "Score normalizado (0 normal, 1 muy raro)"
 
@@ -648,6 +924,14 @@ else:
             with col2:
                 st.metric("Threshold", f"{st.session_state.threshold_actual:.1f} MADs")
                 st.metric("Ventana", f"{st.session_state.window_days} días")
+        elif isinstance(detector, TrafficAnomalyDetectorRCF):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Árboles", f"{st.session_state.rcf_n_trees}")
+                st.metric("Tamaño árbol", f"{st.session_state.rcf_tree_size}")
+            with col2:
+                st.metric("Shingle size", f"{st.session_state.rcf_shingle}")
+                st.metric("Contamination", f"{st.session_state.contamination_rcf:.3f}")
         else:
             st.write(
                 f"Isolation Forest con contamination={st.session_state.contamination_iforest:.3f}."
@@ -659,7 +943,7 @@ else:
         if isinstance(detector, TrafficAnomalyDetectorMAD):
             st.markdown(
                 """
-**MAD (Median Absolute Deviation con ventana deslizante)**[web:29][web:121]  
+**MAD (Median Absolute Deviation con ventana deslizante)**
 
 - Calcula un baseline robusto usando la mediana de la intensidad.
 - Mide cuánto se aleja cada punto usando MAD (mediana de las desviaciones absolutas).
@@ -667,10 +951,21 @@ else:
 - Usa solo los últimos *N días* seleccionados para calcular el baseline.
 """
             )
+        elif isinstance(detector, TrafficAnomalyDetectorRCF):
+            st.markdown(
+                """
+**Random Cut Forest (RCF)**
+
+- Construye un bosque de árboles con cortes aleatorios del espacio y mide cuánto “rompe” un punto la estructura (score *codisp*).
+- No define una línea base explícita; usamos un **score normalizado** (0 = normal, 1 = muy raro).
+- El parámetro **contamination** fija el percentil para etiquetar anomalías (top *p*% más raros).
+- El parámetro **shingle size** permite considerar ventanas de valores para capturar patrones temporales (p. ej., periodicidades diarias).
+"""
+            )
         else:
             st.markdown(
                 """
-**Isolation Forest**[web:140][web:143][web:17]  
+**Isolation Forest**
 
 - Entrena un bosque de árboles que aíslan observaciones en el espacio de features.
 - Los puntos que se aíslan con pocas particiones se consideran anomalías.
@@ -690,10 +985,15 @@ if st.session_state.algoritmo.startswith("MAD"):
         "MAD con ventana deslizante: baseline robusto por mediana, "
         "ventana temporal configurable y umbral en MADs."
     )
-else:
+elif st.session_state.algoritmo.startswith("Isolation"):
     desc_corta = (
         "Isolation Forest: bosque de árboles que aísla puntos raros; "
         "no usa baseline explícito y controla la proporción de anomalías con 'contamination'."
+    )
+else:
+    desc_corta = (
+        "Random Cut Forest: puntuación de rareza (codisp) y etiquetado por percentil "
+        "según 'contamination'; opcional shingling temporal."
     )
 
 st.markdown(
