@@ -425,9 +425,10 @@ class TrafficAnomalyDetectorRCF:
             leaves_set = self.tree_leaves_indexsets[t_idx]
             for i in leaves_set:
                 # i siempre está en el árbol
-                cod = tree.codisp(i)
-                scores[i] += cod
-                counts[i] += 1
+                if i < n:  # seguridad por si el df cambia de longitud
+                    cod = tree.codisp(i)
+                    scores[i] += cod
+                    counts[i] += 1
 
         # Promedio por número de árboles que contienen el índice
         mask = counts > 0
@@ -835,8 +836,8 @@ else:
     if not df_res.empty:
         df_res["timestamp"] = pd.to_datetime(df_res["timestamp"])
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📊 Gráficos", "🔴 Anomalías", "📈 Análisis", "ℹ️ Información"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📊 Gráficos", "🔴 Anomalías", "📈 Análisis", "ℹ️ Información", "📘 Guía del algoritmo"]
     )
 
     # ---------- TAB 1: GRÁFICOS ----------
@@ -1044,6 +1045,128 @@ else:
 - No calcula una línea base explícita, solo un score de rareza por punto.
 """
             )
+
+    # ---------- TAB 5: GUÍA DEL ALGORITMO ----------
+    with tab5:
+        st.subheader("Guía del algoritmo seleccionado")
+
+        if isinstance(detector, TrafficAnomalyDetectorMAD):
+            st.markdown(
+                r"""
+### ¿Qué es MAD (Median Absolute Deviation)?
+**MAD** es una técnica estadística **robusta** frente a outliers.  
+Calcula una **línea base (baseline)** como la **mediana** y mide cuánto se aleja cada punto:
+
+\[
+\text{score}(x_t) = \frac{|x_t - \text{mediana}|}{\text{MAD}}, \quad
+\text{con } \text{MAD} = \text{mediana}(|x - \text{mediana}|)
+\]
+
+Un punto es **anómalo** si su **score** supera el **umbral** (threshold en MADs).
+
+---
+
+### Parámetros que puedes ajustar
+- **Ventana histórica (días)**: cuántos días recientes forman el baseline (mediana y MAD).  
+  **Efecto**:
+  - Ventanas **más largas** → baseline **más estable** (menos sensible a cambios recientes).
+  - Ventanas **más cortas** → baseline **más reactivo** (puede aumentar **falsos positivos** si hay ruido).
+
+- **Threshold (MADs)**: umbral en desviaciones MAD para marcar anomalías.  
+  **Efecto**:
+  - **Subir** threshold (p. ej., 3.0 → 4.0) → **menos** anomalías (más conservador).
+  - **Bajar** threshold (p. ej., 3.0 → 2.5) → **más** anomalías (más sensible).
+
+---
+
+### Cuándo usar MAD
+- Series **univariantes** (ej. intensidad) con **picos puntuales**.
+- Cuando quieres un método **simple, explicable y estable**.
+
+### Recomendaciones
+- Empieza con **ventana 42 días** y **threshold 3.0–3.5**.
+- Si hay demasiadas alertas, **sube** threshold; si detecta pocas, **bájalo**.
+"""
+            )
+
+        elif isinstance(detector, TrafficAnomalyDetectorIForest):
+            st.markdown(
+                """
+### ¿Qué es Isolation Forest?
+**Isolation Forest** construye **árboles aleatorios** que **aíslan** las observaciones.  
+Los puntos raros se aíslan en **pocas particiones** → **más anómalos**.
+
+En scikit-learn:
+- `predict` → **-1** anómalo, **1** normal.  
+- `score_samples` → **más bajo** = **más raro** (en la app se normaliza a 0..1).
+
+---
+
+### Parámetros que puedes ajustar
+- **Contamination** (proporción esperada de anomalías): fija el umbral **implícito**.  
+  **Efecto**:
+  - **Subir** (0.01 → 0.03) → **más** anomalías.
+  - **Bajar** → **menos** anomalías.
+
+*(IForest no tiene baseline explícito; el umbral depende de `contamination`.)*
+
+---
+
+### Cuándo usar IForest
+- Patrones **no lineales** o **multivariantes** (si añades `speed`, `occupancy`, etc.).
+- Cuando no quieres fijar un umbral manual.
+
+### Recomendaciones
+- Empieza con **contamination=0.01**.
+- Aumenta si necesitas **más cobertura**; reduce si hay **falsos positivos**.
+"""
+            )
+
+        elif isinstance(detector, TrafficAnomalyDetectorRCF):
+            st.markdown(
+                """
+### ¿Qué es Random Cut Forest (RCF)?
+**RCF** construye un **bosque** de árboles con **cortes aleatorios** y calcula un score (**codisp**) que mide cuánto **distorsiona** un punto la estructura del conjunto.  
+Normalizamos ese score a **0..1** (0 = normal, 1 = muy raro) y usamos un **umbral por percentil** ligado a `contamination`.
+
+---
+
+### Parámetros que puedes ajustar
+- **Nº de árboles (n_trees)**: más árboles → score **más estable** pero **más lento**.  
+  Recomendación: **100**.
+
+- **Tamaño de árbol (tree_size)**: puntos máx. por árbol (submuestreo).  
+  **Efecto**:  
+  - **Más grande** → más contexto/precisión, **más tiempo**.  
+  - **Más pequeño** → más rápido, posible pérdida de detalle.  
+  Recomendación: **256**.
+
+- **Shingle size**: ventana temporal para contexto (usar los últimos *k* valores como vector).  
+  **Efecto**:  
+  - Captura **patrones temporales** y reduce falsos positivos por ruido.  
+  - Aumentarlo reduce puntos efectivos (primeros *k-1* se descartan).  
+  Recomendación: **1–3**.
+
+- **Contamination**: fija el percentil de score que marca anomalías (top *p*%).  
+  **Efecto**:  
+  - **Subir** (0.01 → 0.03) → **más** anomalías.  
+  - **Bajar** → **menos** anomalías.  
+  En la gráfica de **score** verás la línea del **umbral** usado.
+
+---
+
+### Cuándo usar RCF
+- Cuando quieres **sensibilidad a la estructura** del conjunto y opción de **contexto temporal**.
+- Entornos con **streams/submuestreo** donde un bosque sobre subconjuntos es útil.
+
+### Recomendaciones
+- **n_trees=100**, **tree_size=256**, **shingle=1**, **contamination=0.01** como arranque.  
+- Si va lento con datos grandes, **reduce** `n_trees` o `tree_size`.  
+- Si hay mucho ruido, prueba **shingle 3–5**.
+"""
+            )
+        else:
+            st.info("Selecciona un algoritmo para ver la guía correspondiente.")
 
 # ============================================================================
 # FOOTER: DESCRIPCIÓN RESUMIDA DEL ALGORITMO SELECCIONADO
