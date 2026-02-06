@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,7 +9,7 @@ import warnings
 from sklearn.ensemble import IsolationForest  # Isolation Forest
 
 # ----------------------------------------------------------------------------
-# Random Cut Forest (rrcf) con fallback a rrcf2 y diagnóstico
+# Random Cut Forest (rrcf) con fallback a rrcf2, adaptadores y diagnóstico
 # ----------------------------------------------------------------------------
 import importlib, sys
 
@@ -35,6 +34,30 @@ except Exception as e1:
             "Instala en el mismo entorno: 'uv add rrcf' o 'uv add rrcf2'"
         )
 
+# Adaptadores mínimos para diferencias de backend
+def _rrcf_shingle(values, size: int):
+    # Si el backend expone shingle, úsalo; si no, genera shingling localmente.
+    if RRCF_AVAILABLE and hasattr(rrcf, "shingle"):
+        try:
+            return rrcf.shingle(values, size=size)
+        except Exception:
+            pass
+    arr = np.asarray(values, dtype=float)
+    if len(arr) < size:
+        return []
+    return [arr[i : i + size] for i in range(len(arr) - size + 1)]
+
+def _rrcf_rctree_ctor():
+    # Devuelve el constructor de RCTree o lanza un error amigable.
+    if not RRCF_AVAILABLE:
+        raise RuntimeError("Backend RRCF no disponible.")
+    RCTree = getattr(rrcf, "RCTree", None)
+    if RCTree is None:
+        RCTree = getattr(getattr(rrcf, "rcforest", object), "RCTree", None)
+    if RCTree is None:
+        raise RuntimeError("No se encontró RCTree en el backend RRCF seleccionado.")
+    return RCTree
+
 # ============================================================================
 # CONFIGURACIÓN STREAMLIT
 # ============================================================================
@@ -54,6 +77,7 @@ warnings.filterwarnings(
     module="rrcf",
 )
 
+# CSS CORREGIDO (sin entidades HTML)
 st.markdown(
     """
 <style>
@@ -84,7 +108,7 @@ st.markdown(
 )
 
 # ============================================================================
-# MAD ESTACIONAL (minuto del día + día de la semana) — Sustituye al MAD anterior
+# MAD ESTACIONAL (minuto del día + día de la semana)
 # ============================================================================
 
 class TrafficAnomalyDetectorMAD:
@@ -416,12 +440,13 @@ class TrafficAnomalyDetectorIForest:
         }
 
 # ============================================================================
-# CLASE 3: DETECTOR RANDOM CUT FOREST (optimizado)
+# CLASE 3: DETECTOR RANDOM CUT FOREST (optimizado y robusto)
 # ============================================================================
 
 class TrafficAnomalyDetectorRCF:
     """
     RCF optimizado (sin inserciones temporales al puntuar).
+    Robusto a puntos sin cobertura en árboles (ignora NaNs en normalización).
     """
 
     def __init__(
@@ -457,8 +482,10 @@ class TrafficAnomalyDetectorRCF:
         values = df["intensity"].astype(float).values
         ts = df["timestamp"].values
         if self.shingle_size > 1:
-            shingled = rrcf.shingle(values, size=self.shingle_size)
-            X = np.vstack([v for v in shingled])
+            shingled = _rrcf_shingle(values, size=self.shingle_size)
+            if len(shingled) == 0:
+                return np.empty((0, 1)), ts, values
+            X = np.vstack([np.asarray(v, dtype=float) for v in shingled])
             ts_adj = ts[self.shingle_size - 1 :]
             intens_adj = values[self.shingle_size - 1 :]
             return X, ts_adj, intens_adj
@@ -476,12 +503,14 @@ class TrafficAnomalyDetectorRCF:
         if n == 0:
             self.fitted = False
             return {"puntos": 0}
+
         tree_size = min(self.tree_size, n)
         self.forest = []
         self.tree_leaves_indexsets = []
+        RCTree = _rrcf_rctree_ctor()
         for _ in range(self.n_trees):
             idx = np.random.choice(n, size=tree_size, replace=False)
-            tree = rrcf.RCTree()
+            tree = RCTree()
             for j in idx:
                 tree.insert_point(X[j], index=j)
             self.forest.append(tree)
@@ -500,6 +529,8 @@ class TrafficAnomalyDetectorRCF:
             return []
         scores = np.zeros(n, dtype=float)
         counts = np.zeros(n, dtype=int)
+
+        # Agregar codisp sólo para hojas presentes (cobertura parcial por submuestreo)
         for t_idx, tree in enumerate(self.forest):
             leaves_set = self.tree_leaves_indexsets[t_idx]
             for i in leaves_set:
@@ -507,30 +538,42 @@ class TrafficAnomalyDetectorRCF:
                     cod = tree.codisp(i)
                     scores[i] += cod
                     counts[i] += 1
+
+        # Marcar sin cobertura como NaN
         mask = counts > 0
-        scores[mask] = scores[mask] / counts[mask]
-        smin, smax = float(scores.min()), float(scores.max())
-        denom = (smax - smin) if smax > smin else 1.0
-        scores_norm = (scores - smin) / denom
-        if n > 1:
-            perc = 100.0 * (1.0 - self.contamination)
-            thr = float(np.percentile(scores_norm, perc))
+        scores[~mask] = np.nan
+        if np.any(mask):
+            scores[mask] = scores[mask] / counts[mask]
+            smin = float(np.nanmin(scores))
+            smax = float(np.nanmax(scores))
+            denom = (smax - smin) if smax > smin else 1.0
+            scores_norm = (scores - smin) / denom
+            perc = 100.0 * (1.0 - self.contamination) if mask.sum() > 1 else 100.0
+            thr = float(np.nanpercentile(scores_norm, perc))
         else:
+            scores_norm = np.full(n, np.nan, dtype=float)
             thr = 1.0
+
         self.threshold_score_norm_ = thr
         self.scores_norm_ = scores_norm
+
         resultados = []
         self.anomalias_detectadas = []
         self.score_history = []
         for i in range(n):
-            es_anomalia = scores_norm[i] >= thr
+            if np.isnan(scores_norm[i]):
+                es_anomalia = False
+                conf = 0.0
+            else:
+                es_anomalia = scores_norm[i] >= thr
+                conf = float(scores_norm[i])
             res = {
                 "timestamp": pd.to_datetime(ts[i]),
                 "intensity": float(intens[i]),
                 "expected": np.nan,
-                "score": float(scores_norm[i]),
+                "score": (float(scores_norm[i]) if not np.isnan(scores_norm[i]) else np.nan),
                 "es_anomalia": bool(es_anomalia),
-                "confianza": float(scores_norm[i]),
+                "confianza": conf,
             }
             resultados.append(res)
             self.score_history.append(res)
@@ -551,6 +594,10 @@ class TrafficAnomalyDetectorRCF:
                 else None
             ),
             "threshold_score_norm": self.threshold_score_norm_,
+            "rcf_cobertura_pct": (
+                float(100.0 * np.mean(~np.isnan(self.scores_norm_)))
+                if self.scores_norm_ is not None else None
+            ),
         }
 
 # ============================================================================
@@ -598,6 +645,11 @@ if "rcf_shingle" not in st.session_state:
 if "contamination_rcf" not in st.session_state:
     st.session_state.contamination_rcf = 0.01
 
+# Post-regla de segmentos (MAD) — parámetros UI
+if "seg_min_consec" not in st.session_state:
+    st.session_state.seg_min_consec = 5  # minutos consecutivos mínimos
+if "seg_tolerancia" not in st.session_state:
+    st.session_state.seg_tolerancia = 1  # huecos permitidos dentro del segmento
 
 # ============================================================================
 # CABECERA
@@ -614,39 +666,63 @@ Compara tres algoritmos de detección de anomalías:
 )
 
 # ============================================================================
-# UTILS: POST-REGLA POR SEGMENTOS (para MAD)
+# UTILS: POST-REGLA POR SEGMENTOS (para MAD) — versión robusta
 # ============================================================================
 
 def _filtrar_por_segmentos(df_res: pd.DataFrame, min_consec=5, tolerancia=1):
     """
-    Mantiene como anomalías solo segmentos con >= min_consec minutos por encima del umbral,
-    permitiendo 'tolerancia' minutos intermedios no anómalos.
-    df_res: DataFrame con columnas ['timestamp','es_anomalia'] ya ordenado por tiempo.
+    Morfología 1D: (1) cierra huecos pequeños dentro de runs de 1s (<= tolerancia),
+    (2) descarta segmentos cuya longitud total < min_consec.
+    No expande segmentos más allá de lo debido y no marca como anómalos los gaps no cerrados.
     """
     if df_res.empty:
         return df_res
 
     df = df_res.copy().sort_values("timestamp").reset_index(drop=True)
-    keep = np.zeros(len(df), dtype=bool)
-    i, n = 0, len(df)
+    if "es_anomalia" not in df.columns:
+        return df
+
+    b = df["es_anomalia"].astype(bool).to_numpy()
+    n = len(b)
+    if n == 0:
+        df["es_anomalia"] = b
+        return df
+
+    # 1) Cerrar huecos pequeños si están rodeados por 1s
+    i = 0
     while i < n:
-        if not df.loc[i, "es_anomalia"]:
+        if b[i]:
+            j = i
+            while j < n and b[j]:
+                j += 1
+            # gap entre j..k-1
+            k = j
+            while k < n and not b[k]:
+                k += 1
+            gap_len = k - j
+            if gap_len > 0 and gap_len <= tolerancia and k < n:
+                # Rellenar gap
+                b[j:k] = True
+                i = j
+                continue
+            i = j
+        else:
             i += 1
-            continue
-        j = i
-        gaps = 0
-        consec = 0
-        while j < n:
-            if df.loc[j, "es_anomalia"]:
-                consec += 1
-            else:
-                gaps += 1
-                if gaps > tolerancia:
-                    break
-            j += 1
-        if consec >= min_consec:
-            keep[i:j] = True
-        i = j
+
+    # 2) Mantener solo runs de 1s con longitud >= min_consec
+    keep = np.zeros(n, dtype=bool)
+    i = 0
+    while i < n:
+        if b[i]:
+            j = i
+            while j < n and b[j]:
+                j += 1
+            if (j - i) >= min_consec:
+                keep[i:j] = True
+            i = j
+        else:
+            i += 1
+
     df["es_anomalia"] = keep
     return df
 
@@ -701,7 +777,7 @@ with st.sidebar:
         "Ruido Alto (Sensores malos)": "datos_trafico/trafico_ruido_alto.csv",
         "Últimas 24 horas + Anomalía": "datos_trafico/trafico_ultimas_24h.csv",
 
-        # Rutas a 120 días si existen en tu carpeta
+        # Rutas a 120 días
         "Accidente (4 eventos, 120 días)": "datos_trafico/trafico_accidente_4eventos_120d.csv",
         "Evento Estadio (3 eventos, 120 días)": "datos_trafico/trafico_evento_estadio_3eventos_120d.csv",
         "Puente/Festivo (120 días)": "datos_trafico/trafico_puente_festivo_120d.csv",
@@ -709,6 +785,13 @@ with st.sidebar:
         "Corte Nocturno por Obras (120 días)": "datos_trafico/trafico_corte_nocturno_120d.csv",
         "Sensor Defectuoso (120 días)": "datos_trafico/trafico_sensor_defectuoso_120d.csv",
     }
+
+    # Cache de carga por ruta (no aplica a file_uploader)
+    @st.cache_data(show_spinner=False)
+    def _load_csv_path(path: str) -> pd.DataFrame:
+        df_ = pd.read_csv(path)
+        df_["timestamp"] = pd.to_datetime(df_["timestamp"])
+        return df_.sort_values("timestamp").reset_index(drop=True)
 
     if dataset_seleccionado == "Subir CSV personalizado":
         archivo_cargado = st.file_uploader(
@@ -722,17 +805,17 @@ with st.sidebar:
     if st.button("📂 Cargar Dataset", key="btn_cargar"):
         try:
             if isinstance(archivo_usar, str):
-                df = pd.read_csv(archivo_usar)
+                df = _load_csv_path(archivo_usar)
             else:
                 if archivo_usar is None:
                     st.warning("⚠️ Selecciona un archivo CSV para cargar.")
                     df = None
                 else:
                     df = pd.read_csv(archivo_usar)
+                    df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    df = df.sort_values("timestamp").reset_index(drop=True)
 
             if df is not None:
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                df = df.sort_values("timestamp").reset_index(drop=True)
                 st.session_state.df_cargado = df
 
                 # Crear detector según algoritmo
@@ -752,7 +835,11 @@ with st.sidebar:
                     df_res = pd.DataFrame(resultados)
                     if not df_res.empty:
                         df_res["timestamp"] = pd.to_datetime(df_res["timestamp"])
-                        df_res = _filtrar_por_segmentos(df_res, min_consec=5, tolerancia=1)
+                        df_res = _filtrar_por_segmentos(
+                            df_res,
+                            min_consec=st.session_state.seg_min_consec,
+                            tolerancia=st.session_state.seg_tolerancia
+                        )
                         # Guardar back en los estados del detector
                         st.session_state.detector.anomalias_detectadas = [
                             r for r in df_res.to_dict(orient="records") if r["es_anomalia"]
@@ -853,6 +940,23 @@ with st.sidebar:
         )
         st.session_state.min_obs_per_bucket = min_obs
 
+        # Post-regla de segmentos (MAD)
+        st.markdown("**Post-regla de segmentos**")
+        seg_min = st.slider(
+            "Mínimo de minutos consecutivos (min_consec):",
+            min_value=1, max_value=60,
+            value=st.session_state.seg_min_consec, step=1,
+            help="Longitud mínima de un segmento para considerarlo anomalía."
+        )
+        st.session_state.seg_min_consec = seg_min
+        seg_tol = st.slider(
+            "Huecos permitidos dentro del segmento (tolerancia):",
+            min_value=0, max_value=10,
+            value=st.session_state.seg_tolerancia, step=1,
+            help="Número de minutos no anómalos que se pueden cerrar dentro de un segmento."
+        )
+        st.session_state.seg_tolerancia = seg_tol
+
     elif algoritmo.startswith("Isolation"):
         contamination = st.slider(
             "Contamination (proporción esperada de anomalías):",
@@ -929,11 +1033,15 @@ with st.sidebar:
                         df, threshold=st.session_state.threshold_actual
                     )
 
-                # POST-REGLA: segmentos
+                # POST-REGLA: segmentos con parámetros de la UI
                 df_res = pd.DataFrame(resultados)
                 if not df_res.empty:
                     df_res["timestamp"] = pd.to_datetime(df_res["timestamp"])
-                    df_res = _filtrar_por_segmentos(df_res, min_consec=5, tolerancia=1)
+                    df_res = _filtrar_por_segmentos(
+                        df_res,
+                        min_consec=st.session_state.seg_min_consec,
+                        tolerancia=st.session_state.seg_tolerancia
+                    )
                     st.session_state.detector.anomalias_detectadas = [
                         r for r in df_res.to_dict(orient="records") if r["es_anomalia"]
                     ]
@@ -999,7 +1107,6 @@ with st.sidebar:
         if st.session_state.algoritmo.startswith("Random Cut Forest"):
             st.caption(f"RCF backend: {RRCF_BACKEND or 'n/d'}")
 
-
 # ============================================================================
 # CONTENIDO PRINCIPAL (TABS)
 # ============================================================================
@@ -1055,8 +1162,22 @@ else:
                     )
                 )
 
-            # En el MAD estacional la baseline cambia por minuto,
-            # no dibujamos líneas horizontales de baseline/bandas.
+            # Toggle para dibujar baseline esperada en MAD
+            if isinstance(detector, TrafficAnomalyDetectorMAD):
+                show_expected = st.checkbox(
+                    "Mostrar baseline esperada (mediana estacional)", value=False
+                )
+                if show_expected and "expected" in df_res.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df_res["timestamp"],
+                            y=df_res["expected"],
+                            name="Esperado (mediana estacional)",
+                            mode="lines",
+                            line=dict(color="green", width=1, dash="dot"),
+                            opacity=0.6,
+                        )
+                    )
 
             fig.update_layout(
                 title=f"Intensidad - Algoritmo: {st.session_state.algoritmo}",
@@ -1136,11 +1257,29 @@ else:
                     ).round(0).astype(int).astype(str)
                     + "%",
                 ),
-                width="stretch",
+                width="content",
                 hide_index=True,
+            )
+            # Exportar anomalías
+            csv_anom = df_anom.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Descargar anomalías (CSV)",
+                data=csv_anom,
+                file_name="anomalies.csv",
+                mime="text/csv",
             )
         else:
             st.info("No se han detectado anomalías.")
+
+        # Exportar todos los scores (si existen)
+        if not df_res.empty:
+            csv_scores = df_res.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Descargar scores completos (CSV)",
+                data=csv_scores,
+                file_name="scores.csv",
+                mime="text/csv",
+            )
 
     # ---------- TAB 3: ANÁLISIS ----------
     with tab3:
@@ -1210,6 +1349,16 @@ Un mapa de calor que muestra, para cada **día de la semana (0=Lunes..6=Domingo)
                 st.metric("Shingle size", f"{st.session_state.rcf_shingle}")
                 st.metric("Contamination", f"{st.session_state.contamination_rcf:.3f}")
             st.caption(f"RCF backend: {RRCF_BACKEND or 'n/d'}")
+            # Cobertura
+            stats = detector.get_estadisticas()
+            cov = stats.get("rcf_cobertura_pct")
+            if cov is not None:
+                st.metric("Cobertura de score", f"{cov:.1f}%")
+                if cov < 95.0:
+                    st.info(
+                        "Cobertura < 95%. Considera aumentar 'Nº de árboles' o 'Tamaño del árbol' para que más puntos "
+                        "entren en los árboles y tengan score."
+                    )
         else:
             st.write(
                 f"Isolation Forest con contamination={st.session_state.contamination_iforest:.3f}."
@@ -1248,79 +1397,53 @@ Un mapa de calor que muestra, para cada **día de la semana (0=Lunes..6=Domingo)
 """
             )
 
-    # ---------- TAB 5: GUÍA DEL ALGORITMO ----------
-    with tab5:
-        st.subheader("Guía del algoritmo seleccionado")
+   # ---------- TAB 5: GUÍA DEL ALGORITMO ----------
+with tab5:
+    st.subheader("Guía del algoritmo seleccionado")
 
-        if isinstance(detector, TrafficAnomalyDetectorMAD):
-            st.markdown(
-                r"""
-### ¿Qué es MAD estacional?
-Comparas cada punto con su “normal” del **mismo minuto del día** y **mismo tipo de día (L–D)**, dentro de una ventana de varias semanas.
+    if isinstance(detector, TrafficAnomalyDetectorMAD):
+        st.markdown("### ¿Qué es MAD estacional?")
+        st.markdown(
+            "Comparas cada punto con su “normal” del **mismo minuto del día** y "
+            "**mismo tipo de día (L–D)**, dentro de una ventana de varias semanas."
+        )
+        st.markdown("**Score:**")
+        st.latex(
+            r"\text{score}(t) = \frac{|x_t - \text{mediana}_{\text{dow,min}}|}"
+            r"{\max(\text{MAD}_{\text{dow,min}}, \varepsilon)}"
+        )
+        st.markdown(
+            "- \\(\\varepsilon\\) evita divisiones por cero (suelo de MAD).  \n"
+            "- Umbral en **MADs** (p. ej., 3.5)."
+        )
+        st.markdown("### Consejos")
+        st.markdown(
+            "- **Ventana**: 42–56 días.  \n"
+            "- **Threshold**: 3.5–4.5 según sensibilidad.  \n"
+            "- **Suelo (mad_floor)**: 1.5–2.0 si hay minutos muy estables.  \n"
+            "- **Segmentos**: agrupa anomalías si hay ≥5 minutos consecutivos (limpia puntitos sueltos)."
+        )
 
-**Score**:
-\[
-\text{score}(t) = \frac{|x_t - \text{mediana}_{dow,\,min}|}{\max(\text{MAD}_{dow,\,min}, \varepsilon)}
-\]
+    elif isinstance(detector, TrafficAnomalyDetectorIForest):
+        st.markdown("### Isolation Forest (resumen)")
+        st.markdown(
+            "Aíslas observaciones con cortes aleatorios. Si un punto se aísla rápido, es raro."
+        )
+        st.markdown(
+            "- Umbral indirecto: `contamination` (proporción esperada de anomalías).  \n"
+            "- Ideal con múltiples variables."
+        )
 
-- \(\varepsilon\) evita divisiones por cero (suelo de MAD).
-- Umbral en **MADs** (p. ej., 3.5).
+    elif isinstance(detector, TrafficAnomalyDetectorRCF):
+        st.markdown("### Random Cut Forest (resumen)")
+        st.markdown(
+            "Mide cuánto “rompe” un punto la estructura del conjunto (score **codisp**)."
+        )
+        st.markdown(
+            "- Umbral por percentil (1 - `contamination`).  \n"
+            "- `shingle_size` para forma temporal."
+        )
 
-### Consejos
-- **Ventana**: 42–56 días.
-- **Threshold**: 3.5–4.5 según sensibilidad.
-- **Suelo (mad_floor)**: 1.5–2.0 si hay minutos muy estables.
-- **Segmentos**: agrupa anomalías si hay ≥5 minutos consecutivos (limpia puntitos sueltos).
-"""
-            )
-
-        elif isinstance(detector, TrafficAnomalyDetectorIForest):
-            st.markdown(
-                """
-### Isolation Forest (resumen)
-Aíslas observaciones con cortes aleatorios. Si un punto se aísla rápido, es raro.
-- Umbral indirecto: `contamination` (proporción esperada de anomalías).
-- Ideal con múltiples variables.
-"""
-            )
-
-        elif isinstance(detector, TrafficAnomalyDetectorRCF):
-            st.markdown(
-                """
-### Random Cut Forest (resumen)
-Mide cuánto “rompe” un punto la estructura del conjunto (score **codisp**).
-- Umbral por percentil (1 - `contamination`).
-- `shingle_size` para forma temporal.
-"""
-            )
-
-# ============================================================================
-# FOOTER: DESCRIPCIÓN RESUMIDA DEL ALGORITMO SELECCIONADO
-# ============================================================================
-
-st.divider()
-
-if st.session_state.algoritmo.startswith("MAD"):
-    desc_corta = (
-        "MAD estacional: baseline por minuto del día y día de la semana; "
-        "umbral en MADs; ventana retrospectiva configurable."
-    )
-elif st.session_state.algoritmo.startswith("Isolation"):
-    desc_corta = (
-        "Isolation Forest: bosque de árboles que aísla puntos raros; "
-        "no usa baseline explícito y controla la proporción de anomalías con 'contamination'."
-    )
-else:
-    desc_corta = (
-        "Random Cut Forest: puntuación de rareza (codisp) y etiquetado por percentil "
-        "según 'contamination'; opcional shingling temporal."
-    )
-
-st.markdown(
-    f"""
-<div style="text-align: center; color: #666; font-size: 0.9em;">
-Algoritmo seleccionado: <b>{st.session_state.algoritmo}</b> — {desc_corta}
-</div>
-""",
-    unsafe_allow_html=True,
-)
+    else:
+        # Fallback: por si el detector no matchea ninguna clase (no debería pasar)
+        st.info("Selecciona un algoritmo y carga un dataset para ver la guía.")
