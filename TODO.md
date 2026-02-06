@@ -10,7 +10,7 @@
 ## 🧭 Roadmap por fases
 
 ### Fase 1 — UX y Operación (semanas 1–2)
-- [ ] **Presets por escenario** (Normal / Obra / Accidente / Sensor ruidoso).  
+- [x] **Presets por escenario** (Normal / Obra / Accidente / Sensor ruidoso).  
 - [ ] **Descarga de anomalías** (CSV/Excel) desde la pestaña **🔴 Anomalías**.  
 - [ ] **Informe PDF** (gráficos + parámetros + estadísticas clave).  
 - [ ] **Comparativa lado a lado** (tres algoritmos en paralelo, mismos ejes y ventana).  
@@ -79,7 +79,7 @@ La app puede operar continua o periódicamente, enviar alertas y exponer predicc
 - [ ] **Cambios de régimen** (rupturas tipo BOCPD/ruptures). *(P2–P3)*
 
 ### 5) Exportación / Reporting
-- [ ] **Descarga CSV/Excel** de anomalías (con filtros por severidad y fecha). *(P1)*  
+- [x] **Descarga CSV/Excel** de anomalías (con filtros por severidad y fecha). *(P1)*  
 - [ ] **Informe PDF**: portada, parámetros, gráficos, tabla de anomalías, apéndice. *(P1)*  
 - [ ] **Exportar thresholds y presets** como JSON (reproducibilidad). *(P1)*  
 - [ ] **Reportes programados** por email (diario/semanal). *(P3)*
